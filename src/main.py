@@ -13,28 +13,24 @@ def main():
     print("This agent will help you refine your questions to Genie Space.")
     print("You'll be able to review and adjust the query plan before execution.")
     print()
-    
-    # Configuration
+
     PROFILE = "FE-EAST"
     SPACE_NAME = "Healthcare Genie"
     SPACE_ID = "01f0f218b8c814f3aeb2bcb24c8aa8b5"
     
     try:
-        # Initialize Genie client
         print(f"Connecting to Databricks (profile: {PROFILE})...")
         genie_client = GenieClient(profile=PROFILE, space_name=SPACE_NAME, space_id=SPACE_ID)
         print(f"Connected to Genie Space: '{SPACE_NAME}'")
         print()
-        
-        # Get user question
+
         print("=" * 80)
         user_question = input("What would you like to ask Genie? ")
         
         if not user_question.strip():
             print("No question provided. Exiting.")
             return
-        
-        # Initialize and run agent
+
         agent = GenieAgent(genie_client)
         agent.run(user_question)
         

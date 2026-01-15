@@ -8,11 +8,7 @@ from langchain_databricks import ChatDatabricks
 class AgentState(TypedDict):
     """State for the Genie question clarification agent."""
     user_question: str
-    description: str | None
-    query: str | None
     assumptions: str | None
-    conversation_id: str | None
-    message_id: str | None
     user_approved: bool
     feedback: str | None
     final_result: dict | None
@@ -43,7 +39,7 @@ class GenieAgent:
         workflow.add_node("review_with_llm", self._review_with_llm)
         workflow.add_node("present_plan", self._present_plan)
         workflow.add_node("refine_plan", self._refine_plan)
-        workflow.add_node("execute_plan", self._execute_plan)
+        workflow.add_node("show_results", self._show_results)
 
         workflow.set_entry_point("get_initial_plan")
 
@@ -51,18 +47,18 @@ class GenieAgent:
         workflow.add_edge("refine_plan", "review_with_llm")
         workflow.add_edge("review_with_llm", "present_plan")
 
-        # this piece represents the refinement loop
-        # note that refining the plan is always followed by review with llm then presentation of plan
+        # Conditional: approved -> show results, not approved -> refine
+        # Refining loops back through review and present
         workflow.add_conditional_edges(
             "present_plan",
-            self._should_execute_or_refine,
+            self._should_show_or_refine,
             {
-                "execute": "execute_plan",
+                "show": "show_results",
                 "refine": "refine_plan"
             }
         )
         
-        workflow.add_edge("execute_plan", END)
+        workflow.add_edge("show_results", END)
         
         return workflow.compile()
     
@@ -73,20 +69,14 @@ class GenieAgent:
             state: Current agent state
             
         Returns:
-            Updated state with description, query, and conversation ID
+            Updated state (GenieClient manages Genie state internally)
         """
         print(f"\nAsking Genie: '{state['user_question']}'")
         print("Waiting for Genie's response...\n")
         
-        response = self.genie.start_conversation(state["user_question"])
+        self.genie.start_conversation(state["user_question"])
         
-        return {
-            **state,
-            "description": response["description"],
-            "query": response["query"],
-            "conversation_id": response["conversation_id"],
-            "message_id": response["message_id"]
-        }
+        return state
     
     def _review_with_llm(self, state: AgentState) -> AgentState:
         """Use LLM to extract top 3 assumptions from the query plan.
@@ -97,7 +87,10 @@ class GenieAgent:
         Returns:
             Updated state with assumptions
         """
-        if not state["description"] or not state["query"]:
+        description = self.genie.get_description()
+        query = self.genie.get_query()
+        
+        if not description or not query:
             return {**state, "assumptions": None}
         
         print("Analyzing assumptions with LLM...\n")
@@ -105,10 +98,10 @@ class GenieAgent:
         prompt = f"""Given this database query interpretation and SQL plan, identify the top 3 most important assumptions being made.
 
 INTERPRETATION:
-{state['description']}
+{description}
 
 SQL QUERY:
-{state['query']}
+{query}
 
 Please list exactly 3 key assumptions that are being made about:
 - What data is being used
@@ -138,17 +131,20 @@ Format your response as a numbered list (1., 2., 3.) with each assumption on its
         print("GENIE'S PLAN")
         print("=" * 80)
 
-        if state["description"]:
+        description = self.genie.get_description()
+        query = self.genie.get_query()
+
+        if description:
             print("\nGENIE'S INTERPRETATION:")
-            print(state["description"])
+            print(description)
 
         if state["assumptions"]:
             print("\nASSUMPTIONS:")
             print(state["assumptions"])
 
-        if state["query"]:
+        if query:
             print("\nSQL QUERY:")
-            print(state["query"])
+            print(query)
         
         print("\n" + "=" * 80)
         print()
@@ -176,48 +172,40 @@ Format your response as a numbered list (1., 2., 3.) with each assumption on its
             state: Current agent state
             
         Returns:
-            Updated state with refined description and query
+            Updated state (GenieClient manages Genie state internally)
         """
         print(f"\nRefining plan based on feedback: '{state['feedback']}'")
-        print("Waiting for Genie's response...\n")
+        print("⏳ Waiting for Genie's response...\n")
         
-        response = self.genie.refine_question(state["feedback"])
+        self.genie.refine_question(state["feedback"])
         
-        return {
-            **state,
-            "description": response["description"],
-            "query": response["query"],
-            "message_id": response["message_id"]
-        }
+        return state
     
-    def _execute_plan(self, state: AgentState) -> AgentState:
-        """Execute the approved plan.
+    def _show_results(self, state: AgentState) -> AgentState:
+        """Show results from the already-executed query.
         
         Args:
             state: Current agent state
             
         Returns:
-            Updated state with execution results
+            Updated state with final results
         """
-        print("\nPlan approved! Executing query...")
-        print("Running query in Genie...\n")
+        print("\nPlan approved! Fetching results...\n")
         
-        result = self.genie.execute_plan(state["message_id"])
+        result = self.genie.get_results()
         
         print("=" * 80)
-        print("QUERY EXECUTED")
+        print("QUERY RESULTS")
         print("=" * 80)
-        
-        if result.get('status'):
-            print(f"Status: {result['status']}")
-        if result.get('statement_id'):
-            print(f"Statement ID: {result['statement_id']}")
+
+        if result.get('summary'):
+            print(f"\nSUMMARY:")
+            print(result['summary'])
+
         if result.get('results'):
             self._display_results(result['results'])
-        elif result.get('error'):
-            print(f"\nError: {result['error']}")
         else:
-            print("\nQuery execution initiated. Check the Databricks Genie Space UI for results.")
+            print("\nNo results available.")
         
         print("=" * 80)
         
@@ -226,16 +214,16 @@ Format your response as a numbered list (1., 2., 3.) with each assumption on its
             "final_result": result
         }
     
-    def _should_execute_or_refine(self, state: AgentState) -> Literal["execute", "refine"]:
-        """Decide whether to execute the plan or refine it.
+    def _should_show_or_refine(self, state: AgentState) -> Literal["show", "refine"]:
+        """Decide whether to show results or refine the plan.
         
         Args:
             state: Current agent state
             
         Returns:
-            Next step: "execute" or "refine"
+            Next step: "show" or "refine"
         """
-        return "execute" if state["user_approved"] else "refine"
+        return "show" if state["user_approved"] else "refine"
     
     def _display_results(self, results: dict) -> None:
         """Display query results in a formatted table.
@@ -253,26 +241,21 @@ Format your response as a numbered list (1., 2., 3.) with each assumption on its
         
         print(f"\nResults ({row_count} row{'s' if row_count != 1 else ''}):")
         print()
-        
-        # Calculate column widths
+
+        # This is fairly unnecessary -- just a way to format sql results
         col_widths = []
         for i, col_name in enumerate(columns):
-            # Start with header width
             max_width = len(col_name)
-            # Check data widths
             for row in rows:
                 if i < len(row):
                     cell_value = str(row[i]) if row[i] is not None else 'NULL'
                     max_width = max(max_width, len(cell_value))
-            # Cap at reasonable width
             col_widths.append(min(max_width, 50))
-        
-        # Print header
+
         header = " | ".join(col.ljust(col_widths[i]) for i, col in enumerate(columns))
         print(header)
         print("-" * len(header))
-        
-        # Print rows
+
         for row in rows:
             row_str = " | ".join(
                 str(row[i] if i < len(row) and row[i] is not None else 'NULL').ljust(col_widths[i])
@@ -293,11 +276,7 @@ Format your response as a numbered list (1., 2., 3.) with each assumption on its
         """
         initial_state: AgentState = {
             "user_question": user_question,
-            "description": None,
-            "query": None,
             "assumptions": None,
-            "conversation_id": None,
-            "message_id": None,
             "user_approved": False,
             "feedback": None,
             "final_result": None
