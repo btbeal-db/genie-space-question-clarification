@@ -1,15 +1,20 @@
 """LangGraph agent for interactive Genie query refinement."""
 from typing import Literal, TypedDict
+import os
+import mlflow
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.types import interrupt
-from genie_client import GenieClient
-from langchain_databricks import ChatDatabricks
+from langgraph.types import interrupt, Command
+from databricks.sdk import WorkspaceClient
+from databricks.sdk.service.dashboards import GenieMessage
+from databricks_langchain import ChatDatabricks
 
 
 class AgentState(TypedDict):
     """State for the Genie question clarification agent."""
     user_question: str
+    conversation_id: str | None
+    current_message: GenieMessage | None
     assumptions: str | None
     user_approved: bool
     feedback: str | None
@@ -19,13 +24,15 @@ class AgentState(TypedDict):
 class GenieAgent:
     """LangGraph agent that interactively refines Genie queries."""
     
-    def __init__(self, genie_client: GenieClient):
-        """Initialize the agent with a Genie client.
+    def __init__(self, databricks_profile: str, space_id: str):
+        """Initialize the agent with Databricks configuration.
         
         Args:
-            genie_client: Configured GenieClient instance
+            databricks_profile: Databricks CLI profile name
+            space_id: Genie Space ID
         """
-        self.genie = genie_client
+        self.client = WorkspaceClient(profile=databricks_profile)
+        self.space_id = space_id
         self.llm = ChatDatabricks(
             endpoint="databricks-gpt-5-2",
             temperature=0.1
@@ -39,35 +46,23 @@ class GenieAgent:
 
         workflow.add_node("get_initial_plan", self._get_initial_plan)
         workflow.add_node("review_with_llm", self._review_with_llm)
-        workflow.add_node("present_plan", self._present_plan)
+        workflow.add_node("approval_gate", self._approval_gate)
+        workflow.add_node("gather_feedback", self._gather_feedback)
         workflow.add_node("refine_plan", self._refine_plan)
         workflow.add_node("show_results", self._show_results)
 
         workflow.set_entry_point("get_initial_plan")
 
         workflow.add_edge("get_initial_plan", "review_with_llm")
+        workflow.add_edge("review_with_llm", "approval_gate")
+        workflow.add_edge("gather_feedback", "refine_plan")
         workflow.add_edge("refine_plan", "review_with_llm")
-        workflow.add_edge("review_with_llm", "present_plan")
-
-        # Conditional: approved -> show results, not approved -> refine
-        # Refining loops back through review and present
-        workflow.add_conditional_edges(
-            "present_plan",
-            self._should_show_or_refine,
-            {
-                "show": "show_results",
-                "refine": "refine_plan"
-            }
-        )
-        
         workflow.add_edge("show_results", END)
-        
-        # Compile with checkpointer for human-in-the-loop
-        # MemorySaver stores state in memory (for local testing)
-        # For production, use a persistent checkpointer (e.g., SqliteSaver)
+
         checkpointer = MemorySaver()
         return workflow.compile(checkpointer=checkpointer)
     
+    @mlflow.trace(span_type="AGENT", name="get_initial_plan")
     def _get_initial_plan(self, state: AgentState) -> AgentState:
         """Get initial plan from Genie based on user question.
         
@@ -75,15 +70,26 @@ class GenieAgent:
             state: Current agent state
             
         Returns:
-            Updated state (GenieClient manages Genie state internally)
+            Updated state with conversation and message
         """
-        print(f"\nAsking Genie: '{state['user_question']}'")
-        print("Waiting for Genie's response...\n")
+        mlflow.log_param("user_question", state["user_question"])
         
-        self.genie.start_conversation(state["user_question"])
+        # Start conversation with Genie
+        message = self.client.genie.start_conversation_and_wait(
+            space_id=self.space_id,
+            content=state["user_question"]
+        )
         
-        return state
+        mlflow.log_param("conversation_id", message.conversation_id)
+        mlflow.log_param("message_id", message.id)
+        
+        return {
+            **state,
+            "conversation_id": message.conversation_id,
+            "current_message": message
+        }
     
+    @mlflow.trace(span_type="LLM", name="review_with_llm")
     def _review_with_llm(self, state: AgentState) -> AgentState:
         """Use LLM to extract top 3 assumptions from the query plan.
         
@@ -93,13 +99,19 @@ class GenieAgent:
         Returns:
             Updated state with assumptions
         """
-        description = self.genie.get_description()
-        query = self.genie.get_query()
+        message = state["current_message"]
+        if not message:
+            return {**state, "assumptions": None}
+        
+        # Extract description and query from message
+        description = self._get_from_query_attachment(message, 'description')
+        query = self._get_from_query_attachment(message, 'query')
         
         if not description or not query:
             return {**state, "assumptions": None}
         
-        print("Analyzing assumptions with LLM...\n")
+        mlflow.log_param("has_description", bool(description))
+        mlflow.log_param("has_query", bool(query))
         
         prompt = f"""Given this database query interpretation and SQL plan, identify the top 3 most important assumptions being made.
 
@@ -119,57 +131,80 @@ Format your response as a numbered list (1., 2., 3.) with each assumption on its
 
         response = self.llm.invoke(prompt)
         
+        assumptions = response.content
+        mlflow.log_text(assumptions, "assumptions.txt")
+        
         return {
             **state,
-            "assumptions": response.content
+            "assumptions": assumptions
         }
     
-    def _present_plan(self, state: AgentState) -> AgentState:
-        """Present the plan to user and wait for their response.
+    @mlflow.trace(span_type="AGENT", name="approval_gate")
+    def _approval_gate(self, state: AgentState) -> Command[Literal["show_results", "gather_feedback"]]:
+        """Present plan and ask for approval (yes/no only).
         
-        This node uses interrupt() to pause execution and wait for human input.
-        The agent will return the plan and resume when the user responds.
+        This node interrupts to show the plan and waits for approval decision.
+        If not approved, routes to gather_feedback to get detailed feedback.
         
         Args:
             state: Current agent state
             
         Returns:
-            Updated state with user approval and feedback
+            Command routing to show_results or gather_feedback
         """
-        description = self.genie.get_description()
-        query = self.genie.get_query()
+        message = state["current_message"]
+        description = self._get_from_query_attachment(message, 'description')
+        query = self._get_from_query_attachment(message, 'query')
         
-        # Package the plan to show to the user
+        # Log the plan being presented
+        mlflow.log_param("plan_description", description[:200] if description else None)  # Truncate for logs
+        mlflow.log_text(query if query else "", "presented_query.sql")
+        
         plan_to_present = {
-            "description": description,
-            "query": query,
-            "assumptions": state["assumptions"]
-        }
-        
-        # Interrupt and wait for human response
-        # This will pause execution and return control
-        # The user's response will be available when resumed
-        user_response = interrupt(plan_to_present)
-        
-        # When resumed, user_response will contain their answer
-        # Expected format: {"approved": true/false, "feedback": "optional feedback"}
-        if user_response and isinstance(user_response, dict):
-            approved = user_response.get("approved", False)
-            feedback = user_response.get("feedback", None)
-            
-            return {
-                **state,
-                "user_approved": approved,
-                "feedback": feedback
+            "question": "Do you approve this plan?",
+            "plan": {
+                "description": description,
+                "query": query,
+                "assumptions": state["assumptions"]
             }
-        
-        # Fallback if no valid response
-        return {
-            **state,
-            "user_approved": False,
-            "feedback": None
         }
+        
+        is_approved = interrupt(plan_to_present)
+        
+        state["user_approved"] = is_approved
+        
+        mlflow.log_param("user_approved", is_approved)
+        
+        if is_approved:
+            return Command(goto="show_results", update=state)
+        else:
+            return Command(goto="gather_feedback", update=state)
     
+    @mlflow.trace(span_type="AGENT", name="gather_feedback")
+    def _gather_feedback(self, state: AgentState) -> Command[Literal["refine_plan"]]:
+        """Gather feedback from user after they reject the plan.
+        
+        This node interrupts to ask what changes the user wants.
+        Always routes to refine_plan after getting feedback.
+        
+        Args:
+            state: Current agent state
+            
+        Returns:
+            Command routing to refine_plan with feedback
+        """
+        feedback_request = {
+            "question": "What would you like to change or add to the plan?"
+        }
+
+        feedback = interrupt(feedback_request)
+        state["feedback"] = feedback
+        
+        mlflow.log_param("user_feedback", feedback)
+        
+        return Command(goto="refine_plan", update=state)
+    
+    @mlflow.trace(span_type="AGENT", name="refine_plan")
     def _refine_plan(self, state: AgentState) -> AgentState:
         """Refine the plan based on user feedback.
         
@@ -177,15 +212,24 @@ Format your response as a numbered list (1., 2., 3.) with each assumption on its
             state: Current agent state
             
         Returns:
-            Updated state (GenieClient manages Genie state internally)
+            Updated state with refined message
         """
-        print(f"\nRefining plan based on feedback: '{state['feedback']}'")
-        print("⏳ Waiting for Genie's response...\n")
+        mlflow.log_param("refinement_feedback", state["feedback"])
         
-        self.genie.refine_question(state["feedback"])
+        message = self.client.genie.create_message_and_wait(
+            space_id=self.space_id,
+            conversation_id=state["conversation_id"],
+            content=state["feedback"]
+        )
         
-        return state
+        mlflow.log_param("refined_message_id", message.id)
+        
+        return {
+            **state,
+            "current_message": message
+        }
     
+    @mlflow.trace(span_type="AGENT", name="show_results")
     def _show_results(self, state: AgentState) -> AgentState:
         """Show results from the already-executed query.
         
@@ -195,81 +239,148 @@ Format your response as a numbered list (1., 2., 3.) with each assumption on its
         Returns:
             Updated state with final results
         """
-        print("\nPlan approved! Fetching results...\n")
-        
-        result = self.genie.get_results()
-        
-        print("=" * 80)
-        print("QUERY RESULTS")
-        print("=" * 80)
+        message = state["current_message"]
 
-        if result.get('summary'):
-            print(f"\nSUMMARY:")
-            print(result['summary'])
+        summary = self._extract_text_summary(message)
+        results = self._extract_results_from_message(message)
+        
+        result = {
+            "summary": summary,
+            "results": results
+        }
+        
+        # Log metrics about results
+        row_count = results.get("row_count", 0)
+        mlflow.log_metric("result_row_count", row_count)
+        mlflow.log_param("has_summary", bool(summary))
+        
+        if summary:
+            mlflow.log_text(summary, "result_summary.txt")
 
-        if result.get('results'):
-            self._display_results(result['results'])
-        else:
-            print("\nNo results available.")
-        
-        print("=" * 80)
-        
         return {
             **state,
             "final_result": result
         }
     
-    def _should_show_or_refine(self, state: AgentState) -> Literal["show", "refine"]:
-        """Decide whether to show results or refine the plan.
+    def _get_from_query_attachment(self, message: GenieMessage, attr_name: str) -> str | None:
+        """Extract an attribute from the query attachment.
         
         Args:
-            state: Current agent state
+            message: GenieMessage object
+            attr_name: Name of the attribute to extract (e.g. 'description', 'query')
             
         Returns:
-            Next step: "show" or "refine"
+            Attribute value or None
         """
-        return "show" if state["user_approved"] else "refine"
+        if not message:
+            return None
+        try:
+            for attachment in message.attachments:
+                if attachment.query is not None:
+                    return getattr(attachment.query, attr_name, None)
+        except (AttributeError, TypeError):
+            pass
+        return None
     
-    def _display_results(self, results: dict) -> None:
-        """Display query results in a formatted table.
+    def _extract_text_summary(self, message: GenieMessage) -> str | None:
+        """Extract plain text summary from message attachments.
         
         Args:
-            results: dict with 'columns', 'rows', and 'row_count'
+            message: GenieMessage object
+            
+        Returns:
+            Plain text summary if available, None otherwise
         """
-        columns = results.get('columns', [])
-        rows = results.get('rows', [])
-        row_count = results.get('row_count', 0)
-        
-        if not rows:
-            print("\nNo results returned.")
-            return
-        
-        print(f"\nResults ({row_count} row{'s' if row_count != 1 else ''}):")
-        print()
-
-        # This is fairly unnecessary -- just a way to format sql results
-        col_widths = []
-        for i, col_name in enumerate(columns):
-            max_width = len(col_name)
-            for row in rows:
-                if i < len(row):
-                    cell_value = str(row[i]) if row[i] is not None else 'NULL'
-                    max_width = max(max_width, len(cell_value))
-            col_widths.append(min(max_width, 50))
-
-        header = " | ".join(col.ljust(col_widths[i]) for i, col in enumerate(columns))
-        print(header)
-        print("-" * len(header))
-
-        for row in rows:
-            row_str = " | ".join(
-                str(row[i] if i < len(row) and row[i] is not None else 'NULL').ljust(col_widths[i])
-                for i in range(len(columns))
-            )
-            print(row_str)
-        
-        print()
+        try:
+            if message.attachments:
+                for attachment in message.attachments:
+                    if attachment.text is not None:
+                        return getattr(attachment.text, 'content', None)
+        except (AttributeError, TypeError):
+            pass
+        return None
     
+    def _extract_results_from_message(self, message: GenieMessage) -> dict:
+        """Extract query results from message query_result and statement execution.
+        
+        Args:
+            message: GenieMessage object with query results
+            
+        Returns:
+            dict with columns and data
+        """
+        columns = []
+        rows = []
+
+        statement_id = None
+        try:
+            if message.query_result:
+                statement_id = getattr(message.query_result, 'statement_id', None)
+        except (AttributeError, TypeError):
+            pass
+        
+        if not statement_id:
+            return {"columns": columns, "rows": rows, "row_count": 0}
+        
+        try:
+            stmt = self.client.statement_execution.get_statement(statement_id)
+            return self._extract_results(stmt)
+        except Exception:
+            return {"columns": columns, "rows": rows, "row_count": 0}
+    
+    def _extract_results(self, statement_response) -> dict:
+        """Extract results from a statement response.
+        
+        Args:
+            statement_response: StatementResponse object
+            
+        Returns:
+            dict with columns and data
+        """
+        columns = []
+        rows = []
+
+        try:
+            schema = statement_response.manifest.schema
+            columns = [col.name for col in schema.columns]
+        except (AttributeError, TypeError):
+            pass
+
+        statement_id = getattr(statement_response, 'statement_id', None)
+        if not statement_id:
+            return {"columns": columns, "rows": rows, "row_count": 0}
+
+        try:
+            result = statement_response.result
+
+            if result.data_array is not None:
+                rows = result.data_array
+            else:
+                chunks = statement_response.manifest.chunks
+                if chunks:
+                    for chunk_info in chunks:
+                        chunk_index = getattr(chunk_info, 'chunk_index', 0)
+                        
+                        try:
+                            chunk_data = self.client.statement_execution.get_statement_result_chunk_n(
+                                statement_id=statement_id,
+                                chunk_index=chunk_index
+                            )
+                            
+                            if chunk_data.data_array:
+                                rows.extend(chunk_data.data_array)
+                        except Exception:
+                            pass 
+        except (AttributeError, TypeError):
+            pass
+        
+        return {
+            "columns": columns,
+            "rows": rows,
+            "row_count": len(rows)
+        }
+    
+    @mlflow.trace(span_type="AGENT", name="genie_agent_run")
     def run(self, user_question: str, thread_id: str = "default") -> dict:
         """Run the agent with a user question (will interrupt for human input).
         
@@ -278,10 +389,15 @@ Format your response as a numbered list (1., 2., 3.) with each assumption on its
             thread_id: Unique ID for this conversation thread
             
         Returns:
-            Dict with either the plan (if interrupted) or final result
+            Dict with state including __interrupt__ key if paused
         """
+        mlflow.log_param("initial_question", user_question)
+        mlflow.log_param("thread_id", thread_id)
+        
         initial_state: AgentState = {
             "user_question": user_question,
+            "conversation_id": None,
+            "current_message": None,
             "assumptions": None,
             "user_approved": False,
             "feedback": None,
@@ -290,29 +406,42 @@ Format your response as a numbered list (1., 2., 3.) with each assumption on its
         
         config = {"configurable": {"thread_id": thread_id}}
         
-        # Stream the execution - this will pause at interrupt points
-        for event in self.graph.stream(initial_state, config, stream_mode="values"):
-            # event contains the current state
-            pass
+        result = self.graph.invoke(initial_state, config)
         
-        # Return the final state or interruption info
-        return event
+        # Log if we hit an interrupt
+        if "__interrupt__" in result:
+            mlflow.log_param("status", "interrupted")
+        elif result.get("final_result"):
+            mlflow.log_param("status", "completed")
+        
+        return result
+
+
+def create_graph():
+    """Factory function to create the Genie agent graph for LangGraph Studio.
     
-    def resume(self, user_response: dict, thread_id: str = "default") -> dict:
-        """Resume execution after human input.
-        
-        Args:
-            user_response: User's response with format {"approved": bool, "feedback": str}
-            thread_id: Same thread ID used in run()
-            
-        Returns:
-            Dict with either updated plan (if refined) or final result
-        """
-        config = {"configurable": {"thread_id": thread_id}}
-        
-        # Resume from checkpoint with user's response
-        for event in self.graph.stream(user_response, config, stream_mode="values"):
-            pass
-        
-        return event
+    This function is called by LangGraph Studio/API to instantiate the graph.
+    Configuration is read from environment variables.
+    
+    Environment variables required:
+    - DATABRICKS_PROFILE: Databricks CLI profile name (default: "FE-EAST")
+    - GENIE_SPACE_ID: ID of the Genie Space (required)
+    
+    Returns:
+        Compiled LangGraph graph ready for execution
+    """
+    profile = os.getenv("DATABRICKS_PROFILE", "FE-EAST")
+    space_id = os.getenv("GENIE_SPACE_ID")
+    
+    if not space_id:
+        raise ValueError(
+            "GENIE_SPACE_ID environment variable is required. "
+            "Find this in your Genie Space URL."
+        )
+    
+    agent = GenieAgent(
+        databricks_profile=profile,
+        space_id=space_id
+    )
+    return agent.graph
 

@@ -1,0 +1,7 @@
+{
+    "dependencies": ["."],
+    "graphs": {
+      "genie_agent": "./src/agent.py:create_graph"
+    },
+    "env": ".env"
+  }

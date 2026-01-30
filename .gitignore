@@ -5,6 +5,7 @@ __pycache__/
 *.so
 .Python
 env/
+.env
 venv/
 .venv/
 *.egg-info/
@@ -22,3 +23,6 @@ build/
 
 # OS
 .DS_Store
+
+.langgraph_api/
+mlruns/

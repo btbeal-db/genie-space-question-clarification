@@ -1,6 +1,6 @@
 """CLI entry point for Genie Question Clarification Agent."""
 import sys
-from genie_client import GenieClient
+from databricks.sdk import WorkspaceClient
 from agent import GenieAgent
 
 
@@ -15,14 +15,15 @@ def main():
     print()
 
     PROFILE = "FE-EAST"
-    SPACE_NAME = "Healthcare Genie"
     SPACE_ID = "01f0f218b8c814f3aeb2bcb24c8aa8b5"
     
     try:
         print(f"Connecting to Databricks (profile: {PROFILE})...")
-        genie_client = GenieClient(profile=PROFILE, space_name=SPACE_NAME, space_id=SPACE_ID)
-        print("Genie Space: ",genie_client.client.genie.get_space(space_id=SPACE_ID))
-        print(f"Connected to Genie Space: '{SPACE_NAME}'")
+        
+        # Verify connection
+        client = WorkspaceClient(profile=PROFILE)
+        space = client.genie.get_space(space_id=SPACE_ID)
+        print(f"Connected to Genie Space: '{space.display_name}'")
         print()
         print("=" * 80)
         user_question = input("What would you like to ask Genie? ")
@@ -31,7 +32,7 @@ def main():
             print("No question provided. Exiting.")
             return
 
-        agent = GenieAgent(genie_client)
+        agent = GenieAgent(databricks_profile=PROFILE, space_id=SPACE_ID)
         agent.run(user_question)
         
         print("\nDone! Thank you for using the Genie Question Clarification Agent.")
