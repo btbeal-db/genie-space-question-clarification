@@ -21,9 +21,9 @@ def main():
     try:
         print(f"Connecting to Databricks (profile: {PROFILE})...")
         genie_client = GenieClient(profile=PROFILE, space_name=SPACE_NAME, space_id=SPACE_ID)
+        print("Genie Space: ",genie_client.client.genie.get_space(space_id=SPACE_ID))
         print(f"Connected to Genie Space: '{SPACE_NAME}'")
         print()
-
         print("=" * 80)
         user_question = input("What would you like to ask Genie? ")
         

@@ -1,6 +1,8 @@
 """LangGraph agent for interactive Genie query refinement."""
 from typing import Literal, TypedDict
 from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import interrupt
 from genie_client import GenieClient
 from langchain_databricks import ChatDatabricks
 
@@ -32,7 +34,7 @@ class GenieAgent:
         self.graph = self._build_graph()
     
     def _build_graph(self) -> StateGraph:
-        """Build the LangGraph state machine."""
+        """Build the LangGraph state machine with checkpointing."""
         workflow = StateGraph(AgentState)
 
         workflow.add_node("get_initial_plan", self._get_initial_plan)
@@ -60,7 +62,11 @@ class GenieAgent:
         
         workflow.add_edge("show_results", END)
         
-        return workflow.compile()
+        # Compile with checkpointer for human-in-the-loop
+        # MemorySaver stores state in memory (for local testing)
+        # For production, use a persistent checkpointer (e.g., SqliteSaver)
+        checkpointer = MemorySaver()
+        return workflow.compile(checkpointer=checkpointer)
     
     def _get_initial_plan(self, state: AgentState) -> AgentState:
         """Get initial plan from Genie based on user question.
@@ -119,7 +125,10 @@ Format your response as a numbered list (1., 2., 3.) with each assumption on its
         }
     
     def _present_plan(self, state: AgentState) -> AgentState:
-        """Present the plan to user and collect feedback.
+        """Present the plan to user and wait for their response.
+        
+        This node uses interrupt() to pause execution and wait for human input.
+        The agent will return the plan and resume when the user responds.
         
         Args:
             state: Current agent state
@@ -127,43 +136,39 @@ Format your response as a numbered list (1., 2., 3.) with each assumption on its
         Returns:
             Updated state with user approval and feedback
         """
-        print("=" * 80)
-        print("GENIE'S PLAN")
-        print("=" * 80)
-
         description = self.genie.get_description()
         query = self.genie.get_query()
-
-        if description:
-            print("\nGENIE'S INTERPRETATION:")
-            print(description)
-
-        if state["assumptions"]:
-            print("\nASSUMPTIONS:")
-            print(state["assumptions"])
-
-        if query:
-            print("\nSQL QUERY:")
-            print(query)
         
-        print("\n" + "=" * 80)
-        print()
-
-        response = input("Does this plan look correct? (yes/no): ").strip().lower()
+        # Package the plan to show to the user
+        plan_to_present = {
+            "description": description,
+            "query": query,
+            "assumptions": state["assumptions"]
+        }
         
-        if response in ["yes", "y"]:
+        # Interrupt and wait for human response
+        # This will pause execution and return control
+        # The user's response will be available when resumed
+        user_response = interrupt(plan_to_present)
+        
+        # When resumed, user_response will contain their answer
+        # Expected format: {"approved": true/false, "feedback": "optional feedback"}
+        if user_response and isinstance(user_response, dict):
+            approved = user_response.get("approved", False)
+            feedback = user_response.get("feedback", None)
+            
             return {
                 **state,
-                "user_approved": True,
-                "feedback": None
-            }
-        else:
-            feedback = input("What would you like to change or add? ")
-            return {
-                **state,
-                "user_approved": False,
+                "user_approved": approved,
                 "feedback": feedback
             }
+        
+        # Fallback if no valid response
+        return {
+            **state,
+            "user_approved": False,
+            "feedback": None
+        }
     
     def _refine_plan(self, state: AgentState) -> AgentState:
         """Refine the plan based on user feedback.
@@ -265,14 +270,15 @@ Format your response as a numbered list (1., 2., 3.) with each assumption on its
         
         print()
     
-    def run(self, user_question: str) -> dict:
-        """Run the agent with a user question.
+    def run(self, user_question: str, thread_id: str = "default") -> dict:
+        """Run the agent with a user question (will interrupt for human input).
         
         Args:
             user_question: The question to ask Genie
+            thread_id: Unique ID for this conversation thread
             
         Returns:
-            Final state after execution
+            Dict with either the plan (if interrupted) or final result
         """
         initial_state: AgentState = {
             "user_question": user_question,
@@ -282,6 +288,31 @@ Format your response as a numbered list (1., 2., 3.) with each assumption on its
             "final_result": None
         }
         
-        final_state = self.graph.invoke(initial_state)
-        return final_state
+        config = {"configurable": {"thread_id": thread_id}}
+        
+        # Stream the execution - this will pause at interrupt points
+        for event in self.graph.stream(initial_state, config, stream_mode="values"):
+            # event contains the current state
+            pass
+        
+        # Return the final state or interruption info
+        return event
+    
+    def resume(self, user_response: dict, thread_id: str = "default") -> dict:
+        """Resume execution after human input.
+        
+        Args:
+            user_response: User's response with format {"approved": bool, "feedback": str}
+            thread_id: Same thread ID used in run()
+            
+        Returns:
+            Dict with either updated plan (if refined) or final result
+        """
+        config = {"configurable": {"thread_id": thread_id}}
+        
+        # Resume from checkpoint with user's response
+        for event in self.graph.stream(user_response, config, stream_mode="values"):
+            pass
+        
+        return event
 
