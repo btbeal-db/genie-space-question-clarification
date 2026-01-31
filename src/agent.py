@@ -26,20 +26,27 @@ class GenieAgent:
     
     def __init__(
         self,
-        databricks_profile: str,
         space_id: str,
+        databricks_profile: Optional[str] = None,
+        workspace_client: Optional[WorkspaceClient] = None,
         lakebase_instance: Optional[str] = None,
         use_lakebase: bool = True,
     ):
         """Initialize the agent with Databricks configuration.
         
         Args:
-            databricks_profile: Databricks CLI profile name
             space_id: Genie Space ID
+            databricks_profile: Databricks CLI profile name (optional)
+            workspace_client: Pre-configured WorkspaceClient (optional)
             lakebase_instance: Lakebase instance name for checkpoint storage
             use_lakebase: If True, use Lakebase for checkpoints; if False, use in-memory
         """
-        self.client = WorkspaceClient(profile=databricks_profile)
+        if workspace_client is not None:
+            self.client = workspace_client
+        elif databricks_profile:
+            self.client = WorkspaceClient(profile=databricks_profile)
+        else:
+            self.client = WorkspaceClient()
         self.space_id = space_id
         self.lakebase_instance = lakebase_instance or os.environ.get("LAKEBASE_INSTANCE_NAME")
         self.use_lakebase = use_lakebase and self.lakebase_instance is not None
@@ -71,9 +78,14 @@ class GenieAgent:
 
         # Use Lakebase checkpointer if configured, otherwise use in-memory.
         if self.use_lakebase:
-            checkpointer = CheckpointSaver(instance_name=self.lakebase_instance)
+            checkpointer = CheckpointSaver(
+                instance_name=self.lakebase_instance,
+                workspace_client=self.client,
+            )
+            checkpointer.setup()
         else:
             checkpointer = MemorySaver()
+        self.checkpointer = checkpointer
         return workflow.compile(checkpointer=checkpointer)
     
     @mlflow.trace(span_type="AGENT", name="get_initial_plan")
@@ -397,6 +409,14 @@ Format your response as a numbered list (1., 2., 3.) with each assumption on its
         config = {"configurable": {"thread_id": thread_id}}
         return self.graph.invoke(Command(resume=user_response), config)
 
+    def close(self) -> None:
+        """Close resources such as the Lakebase connection pool."""
+        if self.use_lakebase and hasattr(self, "checkpointer"):
+            try:
+                self.checkpointer.__exit__(None, None, None)
+            except Exception:
+                pass
+
 
 def create_graph():
     """Factory function to create the Genie agent graph for LangGraph Studio.
@@ -412,7 +432,7 @@ def create_graph():
     Returns:
         Compiled LangGraph graph ready for execution
     """
-    profile = os.getenv("DATABRICKS_PROFILE", "FE-EAST")
+    profile = os.getenv("DATABRICKS_PROFILE")
     space_id = os.getenv("GENIE_SPACE_ID")
     
     if not space_id:
@@ -422,10 +442,10 @@ def create_graph():
         )
     
     agent = GenieAgent(
-        databricks_profile=profile,
         space_id=space_id,
+        databricks_profile=profile,
         lakebase_instance=os.getenv("LAKEBASE_INSTANCE_NAME"),
-        use_lakebase=False,
+        use_lakebase=True,
     )
     return agent.graph
 

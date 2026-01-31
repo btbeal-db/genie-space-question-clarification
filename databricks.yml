@@ -1,0 +1,41 @@
+bundle:
+  name: genie-question-clarification
+
+variables:
+  genie_space_id:
+    description: Genie Space ID for the agent
+  lakebase_instance_name:
+    description: Lakebase instance name for checkpoints
+  endpoint_name:
+    description: Model serving endpoint name
+    default: genie-agent-endpoint
+
+targets:
+  dev:
+    default: true
+    workspace:
+      host: ${env.DATABRICKS_HOST}
+    variables:
+      genie_space_id: ${env.GENIE_SPACE_ID}
+      lakebase_instance_name: ${env.LAKEBASE_INSTANCE_NAME}
+  prod:
+    workspace:
+      host: ${env.DATABRICKS_HOST}
+    variables:
+      genie_space_id: ${env.GENIE_SPACE_ID}
+      lakebase_instance_name: ${env.LAKEBASE_INSTANCE_NAME}
+
+resources:
+  model_serving_endpoints:
+    genie_agent:
+      name: ${var.endpoint_name}
+      config:
+        served_entities:
+          - entity_name: ${bundle.name}
+            entity_version: "1"
+            workload_size: Small
+            scale_to_zero_enabled: true
+        environment_vars:
+          GENIE_SPACE_ID: ${var.genie_space_id}
+          LAKEBASE_INSTANCE_NAME: ${var.lakebase_instance_name}
+

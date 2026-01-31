@@ -32,7 +32,7 @@ def main():
             print("No question provided. Exiting.")
             return
 
-        agent = GenieAgent(databricks_profile=PROFILE, space_id=SPACE_ID)
+        agent = GenieAgent(space_id=SPACE_ID, databricks_profile=PROFILE)
         agent.run(user_question)
         
         print("\nDone! Thank you for using the Genie Question Clarification Agent.")
