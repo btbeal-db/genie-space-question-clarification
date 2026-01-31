@@ -1,5 +1,5 @@
 """LangGraph agent for interactive Genie query refinement."""
-from typing import Literal, TypedDict
+from typing import Literal, TypedDict, Optional
 import os
 import mlflow
 from langgraph.graph import StateGraph, END
@@ -7,7 +7,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import interrupt, Command
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.dashboards import GenieMessage
-from databricks_langchain import ChatDatabricks
+from databricks_langchain import ChatDatabricks, CheckpointSaver
 
 
 class AgentState(TypedDict):
@@ -24,15 +24,25 @@ class AgentState(TypedDict):
 class GenieAgent:
     """LangGraph agent that interactively refines Genie queries."""
     
-    def __init__(self, databricks_profile: str, space_id: str):
+    def __init__(
+        self,
+        databricks_profile: str,
+        space_id: str,
+        lakebase_instance: Optional[str] = None,
+        use_lakebase: bool = True,
+    ):
         """Initialize the agent with Databricks configuration.
         
         Args:
             databricks_profile: Databricks CLI profile name
             space_id: Genie Space ID
+            lakebase_instance: Lakebase instance name for checkpoint storage
+            use_lakebase: If True, use Lakebase for checkpoints; if False, use in-memory
         """
         self.client = WorkspaceClient(profile=databricks_profile)
         self.space_id = space_id
+        self.lakebase_instance = lakebase_instance or os.environ.get("LAKEBASE_INSTANCE_NAME")
+        self.use_lakebase = use_lakebase and self.lakebase_instance is not None
         self.llm = ChatDatabricks(
             endpoint="databricks-gpt-5-2",
             temperature=0.1
@@ -59,7 +69,11 @@ class GenieAgent:
         workflow.add_edge("refine_plan", "review_with_llm")
         workflow.add_edge("show_results", END)
 
-        checkpointer = MemorySaver()
+        # Use Lakebase checkpointer if configured, otherwise use in-memory.
+        if self.use_lakebase:
+            checkpointer = CheckpointSaver(instance_name=self.lakebase_instance)
+        else:
+            checkpointer = MemorySaver()
         return workflow.compile(checkpointer=checkpointer)
     
     @mlflow.trace(span_type="AGENT", name="get_initial_plan")
@@ -72,16 +86,11 @@ class GenieAgent:
         Returns:
             Updated state with conversation and message
         """
-        mlflow.log_param("user_question", state["user_question"])
-        
         # Start conversation with Genie
         message = self.client.genie.start_conversation_and_wait(
             space_id=self.space_id,
             content=state["user_question"]
         )
-        
-        mlflow.log_param("conversation_id", message.conversation_id)
-        mlflow.log_param("message_id", message.id)
         
         return {
             **state,
@@ -110,9 +119,6 @@ class GenieAgent:
         if not description or not query:
             return {**state, "assumptions": None}
         
-        mlflow.log_param("has_description", bool(description))
-        mlflow.log_param("has_query", bool(query))
-        
         prompt = f"""Given this database query interpretation and SQL plan, identify the top 3 most important assumptions being made.
 
 INTERPRETATION:
@@ -132,7 +138,6 @@ Format your response as a numbered list (1., 2., 3.) with each assumption on its
         response = self.llm.invoke(prompt)
         
         assumptions = response.content
-        mlflow.log_text(assumptions, "assumptions.txt")
         
         return {
             **state,
@@ -156,10 +161,6 @@ Format your response as a numbered list (1., 2., 3.) with each assumption on its
         description = self._get_from_query_attachment(message, 'description')
         query = self._get_from_query_attachment(message, 'query')
         
-        # Log the plan being presented
-        mlflow.log_param("plan_description", description[:200] if description else None)  # Truncate for logs
-        mlflow.log_text(query if query else "", "presented_query.sql")
-        
         plan_to_present = {
             "question": "Do you approve this plan?",
             "plan": {
@@ -172,8 +173,6 @@ Format your response as a numbered list (1., 2., 3.) with each assumption on its
         is_approved = interrupt(plan_to_present)
         
         state["user_approved"] = is_approved
-        
-        mlflow.log_param("user_approved", is_approved)
         
         if is_approved:
             return Command(goto="show_results", update=state)
@@ -200,8 +199,6 @@ Format your response as a numbered list (1., 2., 3.) with each assumption on its
         feedback = interrupt(feedback_request)
         state["feedback"] = feedback
         
-        mlflow.log_param("user_feedback", feedback)
-        
         return Command(goto="refine_plan", update=state)
     
     @mlflow.trace(span_type="AGENT", name="refine_plan")
@@ -214,15 +211,11 @@ Format your response as a numbered list (1., 2., 3.) with each assumption on its
         Returns:
             Updated state with refined message
         """
-        mlflow.log_param("refinement_feedback", state["feedback"])
-        
         message = self.client.genie.create_message_and_wait(
             space_id=self.space_id,
             conversation_id=state["conversation_id"],
             content=state["feedback"]
         )
-        
-        mlflow.log_param("refined_message_id", message.id)
         
         return {
             **state,
@@ -249,14 +242,6 @@ Format your response as a numbered list (1., 2., 3.) with each assumption on its
             "results": results
         }
         
-        # Log metrics about results
-        row_count = results.get("row_count", 0)
-        mlflow.log_metric("result_row_count", row_count)
-        mlflow.log_param("has_summary", bool(summary))
-        
-        if summary:
-            mlflow.log_text(summary, "result_summary.txt")
-
         return {
             **state,
             "final_result": result
@@ -391,9 +376,6 @@ Format your response as a numbered list (1., 2., 3.) with each assumption on its
         Returns:
             Dict with state including __interrupt__ key if paused
         """
-        mlflow.log_param("initial_question", user_question)
-        mlflow.log_param("thread_id", thread_id)
-        
         initial_state: AgentState = {
             "user_question": user_question,
             "conversation_id": None,
@@ -408,13 +390,12 @@ Format your response as a numbered list (1., 2., 3.) with each assumption on its
         
         result = self.graph.invoke(initial_state, config)
         
-        # Log if we hit an interrupt
-        if "__interrupt__" in result:
-            mlflow.log_param("status", "interrupted")
-        elif result.get("final_result"):
-            mlflow.log_param("status", "completed")
-        
         return result
+
+    def resume(self, user_response: dict, thread_id: str = "default") -> dict:
+        """Resume the agent after an interrupt with user input."""
+        config = {"configurable": {"thread_id": thread_id}}
+        return self.graph.invoke(Command(resume=user_response), config)
 
 
 def create_graph():
@@ -426,6 +407,7 @@ def create_graph():
     Environment variables required:
     - DATABRICKS_PROFILE: Databricks CLI profile name (default: "FE-EAST")
     - GENIE_SPACE_ID: ID of the Genie Space (required)
+    - LAKEBASE_INSTANCE_NAME: Lakebase instance name (optional)
     
     Returns:
         Compiled LangGraph graph ready for execution
@@ -441,7 +423,9 @@ def create_graph():
     
     agent = GenieAgent(
         databricks_profile=profile,
-        space_id=space_id
+        space_id=space_id,
+        lakebase_instance=os.getenv("LAKEBASE_INSTANCE_NAME"),
+        use_lakebase=False,
     )
     return agent.graph
 
