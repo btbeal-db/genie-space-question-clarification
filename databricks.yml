@@ -9,33 +9,83 @@ variables:
   endpoint_name:
     description: Model serving endpoint name
     default: genie-agent-endpoint
+  uc_catalog:
+    description: Unity Catalog name
+    default: btbeal
+  uc_schema:
+    description: Unity Catalog schema name
+    default: genie-question-refinement
+  model_name:
+    description: Model name in Unity Catalog
+    default: genie_question_clarification_agent
 
 targets:
   dev:
     default: true
-    workspace:
-      host: ${env.DATABRICKS_HOST}
     variables:
       genie_space_id: ${env.GENIE_SPACE_ID}
       lakebase_instance_name: ${env.LAKEBASE_INSTANCE_NAME}
+      uc_catalog: ${env.UC_CATALOG}
+      uc_schema: ${env.UC_SCHEMA}
+      model_name: ${env.MODEL_NAME}
   prod:
-    workspace:
-      host: ${env.DATABRICKS_HOST}
     variables:
       genie_space_id: ${env.GENIE_SPACE_ID}
       lakebase_instance_name: ${env.LAKEBASE_INSTANCE_NAME}
+      uc_catalog: ${env.UC_CATALOG}
+      uc_schema: ${env.UC_SCHEMA}
+      model_name: ${env.MODEL_NAME}
 
 resources:
+  jobs:
+    deploy_genie_model:
+      name: "[${bundle.target}] Deploy Genie Model"
+      tasks:
+        - task_key: deploy_model
+          spark_python_task:
+            python_file: ./deploy_model.py
+          libraries:
+            - pypi:
+                package: mlflow==3.5.1
+            - pypi:
+                package: databricks-langchain[memory]>=0.9.0
+            - pypi:
+                package: databricks-sdk>=0.35.0
+            - pypi:
+                package: langgraph>=0.2.0
+            - pypi:
+                package: langchain-core>=0.3.0
+            - pypi:
+                package: langchain-community>=0.3.0
+          new_cluster:
+            spark_version: "15.4.x-scala2.12"
+            node_type_id: "Standard_DS3_v2"
+            num_workers: 0
+            data_security_mode: SINGLE_USER
+            spark_conf:
+              spark.databricks.cluster.profile: singleNode
+              spark.master: local[*]
+            custom_tags:
+              ResourceClass: SingleNode
+            spark_env_vars:
+              GENIE_SPACE_ID: "01f0f218b8c814f3aeb2bcb24c8aa8b5"
+              LAKEBASE_INSTANCE_NAME: "bbeal-genie-clarification-app"
+              UC_CATALOG: "btbeal"
+              UC_SCHEMA: "genie-question-refinement"
+              MODEL_NAME: "genie_question_clarification_agent"
+              ENDPOINT_NAME: "genie-agent-question-clarification-endpoint"
+              MLFLOW_EXPERIMENT_NAME: "/Users/brennan.beal@databricks.com/genie-clarification-agent"
+
   model_serving_endpoints:
     genie_agent:
-      name: ${var.endpoint_name}
+      name: genie-agent-question-clarification-endpoint
       config:
         served_entities:
-          - entity_name: ${bundle.name}
-            entity_version: "1"
+          - entity_name: btbeal.genie-question-refinement.genie_question_clarification_agent
+            entity_version: "6"
             workload_size: Small
             scale_to_zero_enabled: true
-        environment_vars:
-          GENIE_SPACE_ID: ${var.genie_space_id}
-          LAKEBASE_INSTANCE_NAME: ${var.lakebase_instance_name}
+            environment_vars:
+              GENIE_SPACE_ID: "01f0f218b8c814f3aeb2bcb24c8aa8b5"
+              LAKEBASE_INSTANCE_NAME: "bbeal-genie-clarification-app"
 

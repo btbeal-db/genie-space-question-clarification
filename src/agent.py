@@ -70,13 +70,18 @@ class GenieAgent:
 
         workflow.set_entry_point("get_initial_plan")
 
-        workflow.add_edge("get_initial_plan", "review_with_llm")
+        # Conditional edge: if get_initial_plan failed, go to END; otherwise continue
+        def route_after_initial_plan(state: AgentState) -> str:
+            if state.get("final_result") and state["final_result"].get("status") == "failed":
+                return END
+            return "review_with_llm"
+        
+        workflow.add_conditional_edges("get_initial_plan", route_after_initial_plan)
         workflow.add_edge("review_with_llm", "approval_gate")
         workflow.add_edge("gather_feedback", "refine_plan")
         workflow.add_edge("refine_plan", "review_with_llm")
         workflow.add_edge("show_results", END)
 
-        # Use Lakebase checkpointer if configured, otherwise use in-memory.
         if self.use_lakebase:
             checkpointer = CheckpointSaver(
                 instance_name=self.lakebase_instance,
@@ -98,17 +103,37 @@ class GenieAgent:
         Returns:
             Updated state with conversation and message
         """
-        # Start conversation with Genie
-        message = self.client.genie.start_conversation_and_wait(
-            space_id=self.space_id,
-            content=state["user_question"]
-        )
+        from databricks.sdk.errors import OperationFailed
         
-        return {
-            **state,
-            "conversation_id": message.conversation_id,
-            "current_message": message
-        }
+        try:
+            # Start conversation with Genie
+            message = self.client.genie.start_conversation_and_wait(
+                space_id=self.space_id,
+                content=state["user_question"]
+            )
+            
+            return {
+                **state,
+                "conversation_id": message.conversation_id,
+                "current_message": message
+            }
+        except OperationFailed as e:
+            # Genie couldn't process the query - return helpful error state
+            # This happens for non-data queries like "Hello, world!"
+            return {
+                **state,
+                "conversation_id": None,
+                "current_message": None,
+                "final_result": {
+                    "status": "failed",
+                    "error": str(e),
+                    "summary": (
+                        "I couldn't process that query. I'm designed to answer questions about your data. "
+                        "Please ask a specific question about your database, like 'What are the top 10 customers by revenue?' "
+                        "or 'Show me sales trends over the last year.'"
+                    ),
+                }
+            }
     
     @mlflow.trace(span_type="LLM", name="review_with_llm")
     def _review_with_llm(self, state: AgentState) -> AgentState:
@@ -173,20 +198,27 @@ Format your response as a numbered list (1., 2., 3.) with each assumption on its
         description = self._get_from_query_attachment(message, 'description')
         query = self._get_from_query_attachment(message, 'query')
         
-        plan_to_present = {
-            "question": "Do you approve this plan?",
-            "plan": {
-                "description": description,
-                "query": query,
-                "assumptions": state["assumptions"]
-            }
-        }
+        plan_text = f"""
+        The following plan was constructed based on your question, with our assumptions highlighted.
+        Does this appear correct? Answer 'yes' and we'll execute the plan or 'no' to refine based on your input.
+
+        INTERPRETATION:
+        {description}
+
+        SQL QUERY:
+        {query}
+
+        ASSUMPTIONS:
+        {state['assumptions']}
+        """
+
+        plan_to_present = {"question": plan_text}
         
         is_approved = interrupt(plan_to_present)
         
         state["user_approved"] = is_approved
         
-        if is_approved:
+        if is_approved.lower() in {"yes", "y", "true", "t", "1"}:
             return Command(goto="show_results", update=state)
         else:
             return Command(goto="gather_feedback", update=state)
@@ -204,11 +236,8 @@ Format your response as a numbered list (1., 2., 3.) with each assumption on its
         Returns:
             Command routing to refine_plan with feedback
         """
-        feedback_request = {
-            "question": "What would you like to change or add to the plan?"
-        }
 
-        feedback = interrupt(feedback_request)
+        feedback = interrupt("What would you like to change or add to the plan?")
         state["feedback"] = feedback
         
         return Command(goto="refine_plan", update=state)

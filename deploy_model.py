@@ -32,6 +32,21 @@ def main() -> None:
     mlflow.set_experiment(experiment_name)
 
     from src.serving_model import GenieServingModel
+    from mlflow.models import infer_signature
+
+    # Define input/output examples for signature
+    input_example = {
+        "action": "run",
+        "question": "What is the average patient age?",
+        "thread_id": "example-thread"
+    }
+    output_example = {
+        "__interrupt__": {
+            "plan": "Sample plan",
+            "assumptions": ["Assumption 1", "Assumption 2"]
+        }
+    }
+    signature = infer_signature(input_example, output_example)
 
     with mlflow.start_run(run_name="genie-agent-serving") as run:
         model_info = mlflow.pyfunc.log_model(
@@ -46,6 +61,8 @@ def main() -> None:
                 "langchain-core>=0.3.0",
                 "langchain-community>=0.3.0",
             ],
+            signature=signature,
+            input_example=input_example,
         )
 
         model_uri = model_info.model_uri
