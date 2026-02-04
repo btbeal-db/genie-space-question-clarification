@@ -96,7 +96,7 @@ databricks-ai-bridge==0.13.0
     # via
     #   databricks-langchain
     #   databricks-mcp
-databricks-connect==17.0.10
+databricks-connect==16.1.7
     # via
     #   databricks-agents
     #   unitycatalog-ai
@@ -374,7 +374,7 @@ mypy-extensions==1.1.0
     # via typing-inspect
 nest-asyncio==1.6.0
     # via unitycatalog-ai
-numpy==2.4.2
+numpy==1.26.4
     # via
     #   contourpy
     #   databricks-connect
@@ -478,7 +478,7 @@ psycopg-pool==3.3.0
     # via
     #   langgraph-checkpoint-postgres
     #   psycopg
-py4j==0.10.9.9
+py4j==0.10.9.7
     # via databricks-connect
 pyarrow==21.0.0
     # via
@@ -655,7 +655,9 @@ typer-slim==0.21.1
     # via huggingface-hub
 typing-extensions==4.15.0
     # via
+    #   aiosignal
     #   alembic
+    #   anyio
     #   azure-core
     #   azure-storage-blob
     #   azure-storage-file-datalake
@@ -673,10 +675,13 @@ typing-extensions==4.15.0
     #   opentelemetry-exporter-otlp-proto-http
     #   opentelemetry-sdk
     #   opentelemetry-semantic-conventions
+    #   psycopg
     #   psycopg-pool
     #   pydantic
     #   pydantic-core
+    #   referencing
     #   sqlalchemy
+    #   starlette
     #   typer-slim
     #   typing-inspect
     #   typing-inspection

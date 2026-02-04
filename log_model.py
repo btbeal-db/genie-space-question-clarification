@@ -100,7 +100,8 @@ def log_and_register(
                 "genie_space_id": genie_space_id,
                 "lakebase_instance_name": lakebase_instance_name,
             },
-            pip_requirements=PIP_REQUIREMENTS,
+            pip_requirements="requirements.txt",
+            code_paths=["src"],
             input_example=False,
         )
         
