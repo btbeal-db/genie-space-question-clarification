@@ -20,8 +20,11 @@ from mlflow.types.responses import (
 from langchain_core.messages import HumanMessage
 from langgraph.types import Command
 
+from dotenv import load_dotenv
+import os
 from src.agent import GenieQueryAgent, AgentState
 
+load_dotenv()
 
 class GenieResponsesAgent(ResponsesAgent):
     """Serve GenieQueryAgent as a ResponsesAgent for Databricks Model Serving.
@@ -252,8 +255,8 @@ class GenieResponsesAgent(ResponsesAgent):
             )
 
 
-genie_space_id = "01f0f218b8c814f3aeb2bcb24c8aa8b5"
-lakebase_instance_name = "bbeal-genie-clarification-app"   
+genie_space_id = os.getenv("GENIE_SPACE_ID")
+lakebase_instance_name = os.getenv("LAKEBASE_INSTANCE_NAME")   
 mlflow.langchain.autolog()
 
 query_agent = GenieQueryAgent(
