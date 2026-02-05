@@ -91,7 +91,9 @@ cryptography==46.0.4
 cycler==0.12.1
     # via matplotlib
 databricks-agents==1.9.0
-    # via mlflow
+    # via
+    #   genie-question-clarification (pyproject.toml)
+    #   mlflow
 databricks-ai-bridge==0.13.0
     # via
     #   databricks-langchain

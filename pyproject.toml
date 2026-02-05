@@ -7,6 +7,7 @@ requires-python = ">=3.10,<3.12"
 dependencies = [
     "pydantic>=2.0",
     "databricks-langchain[memory]>=0.12.0",  # 0.12+ has CheckpointSaver
+    "databricks-agents>=0.15.0",  # GenieAgentClient for Genie integration
     "langgraph>=0.2.0",
     "databricks-sdk>=0.35.0",
     "python-dotenv>=1.0.0",
@@ -16,6 +17,7 @@ dependencies = [
     "mlflow==3.5.1",
     "mlflow[databricks]",
     "langgraph-cli[inmem]>=0.1.0",
+    "langchain>=1.2.8",
 ]
 
 [tool.uv]

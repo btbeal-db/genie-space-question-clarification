@@ -845,8 +845,10 @@ name = "genie-question-clarification"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "databricks-agents" },
     { name = "databricks-langchain", extra = ["memory"] },
     { name = "databricks-sdk" },
+    { name = "langchain" },
     { name = "langchain-community" },
     { name = "langchain-core" },
     { name = "langgraph" },
@@ -859,8 +861,10 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "databricks-agents", specifier = ">=0.15.0" },
     { name = "databricks-langchain", extras = ["memory"], specifier = ">=0.12.0" },
     { name = "databricks-sdk", specifier = ">=0.35.0" },
+    { name = "langchain", specifier = ">=1.2.8" },
     { name = "langchain-community", specifier = ">=0.3.0" },
     { name = "langchain-core", specifier = ">=0.3.0" },
     { name = "langgraph", specifier = ">=0.2.0" },
