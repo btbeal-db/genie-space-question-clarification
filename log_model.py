@@ -9,17 +9,18 @@ from mlflow.models.resources import (
 )
 
 from dotenv import load_dotenv
-load_dotenv()
 import os
+load_dotenv()
 
 profile = os.getenv("DATABRICKS_CONFIG_PROFILE", "DEFAULT")
+experiment_name = os.getenv("MLFLOW_EXPERIMENT_NAME")
 
-genie_space_id = "01f0f218b8c814f3aeb2bcb24c8aa8b5"
-lakebase_instance_name = "bbeal-genie-clarification-app"
-sql_warehouse_id = "148ccb90800933a1"
+genie_space_id = os.getenv("GENIE_SPACE_ID")
+lakebase_instance_name = os.getenv("LAKEBASE_INSTANCE_NAME")
+sql_warehouse_id = os.getenv("SQL_WAREHOUSE_ID")
 serving_endpoint_name = "databricks-claude-sonnet-4"
-table_name = "btbeal.genie_question_refinement.mock_healthcare_data"
-model_name = "btbeal.genie_question_refinement.genie_clarification_agent"
+table_name = os.getenv("TABLE_NAME")
+model_name = os.getenv("MODEL_NAME")
 
 resources = [
     DatabricksGenieSpace(genie_space_id=genie_space_id),
@@ -35,10 +36,9 @@ if __name__ == "__main__":
     host = client.config.host
     print(f"Using Databricks workspace: {host}")
 
-    # Configure MLflow
     mlflow.set_tracking_uri(f"databricks://{profile}")
     mlflow.set_registry_uri("databricks-uc")
-    mlflow.set_experiment("/Users/brennan.beal@databricks.com/genie-question-clarification")
+    mlflow.set_experiment(experiment_name)
     with mlflow.start_run() as run:
             model_info = mlflow.pyfunc.log_model(
                 python_model="src/serving_model.py",
