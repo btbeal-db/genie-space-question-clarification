@@ -59,7 +59,6 @@ class GenieQueryAgent:
             include_context=True,
         )
         
-        # LLM for analyzing assumptions
         self.llm = ChatDatabricks(
             endpoint="databricks-claude-sonnet-4",
             temperature=0.1
@@ -80,7 +79,6 @@ class GenieQueryAgent:
 
         workflow.set_entry_point("query_genie")
 
-        # Route based on whether Genie succeeded
         def route_after_query(state: AgentState) -> str:
             if state.get("final_result") and state["final_result"].get("status") == "failed":
                 return END
@@ -92,12 +90,9 @@ class GenieQueryAgent:
         workflow.add_edge("refine_query", "extract_assumptions")
         workflow.add_edge("finalize_results", END)
 
-        # Setup checkpointer
-        # Note: In Model Serving, CheckpointSaver auto-authenticates via service principal
         if self.use_lakebase:
             checkpointer = CheckpointSaver(
                 instance_name=self.lakebase_instance,
-                # Don't pass workspace_client - let it auto-authenticate
             )
             checkpointer.setup()
         else:
@@ -113,23 +108,14 @@ class GenieQueryAgent:
         Uses GenieAgent which handles all the API complexity including waiting.
         """
         try:
-            # Prepare input for GenieAgent
             genie_input = {
                 "messages": state["messages"],
             }
-            
-            # Add conversation_id for follow-up queries
+
             if state.get("conversation_id"):
                 genie_input["conversation_id"] = state["conversation_id"]
-            
-            # Invoke GenieAgent (handles waiting internally)
+
             result = self.genie.invoke(genie_input)
-            
-            # Extract results from GenieAgent response
-            # result["messages"] contains AIMessages with names:
-            # - "query_reasoning" (if include_context=True)
-            # - "query_sql" (if include_context=True) 
-            # - "query_result"
             query_reasoning = None
             query_sql = None
             query_result = None
@@ -152,7 +138,6 @@ class GenieQueryAgent:
             }
             
         except Exception as e:
-            # Handle errors gracefully
             error_msg = str(e)
             return {
                 **state,
@@ -221,10 +206,8 @@ Does this appear correct? Answer 'yes' to see results or 'no' to refine.
 {state.get('assumptions', 'N/A')}
 """
         
-        # Interrupt and wait for user response
         user_response = interrupt({"question": plan_text})
         
-        # Check if approved
         if isinstance(user_response, str):
             is_approved = user_response.lower() in {"yes", "y", "true", "t", "1", "ok", "okay", "approve", "approved"}
         else:
@@ -240,7 +223,6 @@ Does this appear correct? Answer 'yes' to see results or 'no' to refine.
         """Gather feedback from user after they reject the plan."""
         feedback = interrupt("What would you like to change or add to the plan?")
         
-        # Add feedback as a new message for the follow-up query
         new_messages = list(state.get("messages", []))
         new_messages.append(HumanMessage(content=feedback))
         
@@ -260,7 +242,6 @@ Does this appear correct? Answer 'yes' to see results or 'no' to refine.
             
             result = self.genie.invoke(genie_input)
             
-            # Extract results
             query_reasoning = None
             query_sql = None
             query_result = None
@@ -341,7 +322,7 @@ Does this appear correct? Answer 'yes' to see results or 'no' to refine.
             except Exception:
                 pass
 
-
+# This is useful for the langsmith local debugging/visualization
 def create_graph(model_config: dict = None):
     """Factory function to create the Genie agent graph.
     
@@ -367,8 +348,3 @@ def create_graph(model_config: dict = None):
         use_lakebase=lakebase_instance is not None,
     )
     return agent.graph
-
-
-# For MLflow models-from-code logging
-import mlflow
-mlflow.models.set_model(create_graph)

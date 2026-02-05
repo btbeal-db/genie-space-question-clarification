@@ -1,26 +1,8 @@
-"""MLflow ResponsesAgent wrapper for GenieQueryAgent serving.
+"""
+MLflow ResponsesAgent wrapper for GenieQueryAgent serving.
 
 This module provides a ResponsesAgent implementation that wraps the GenieQueryAgent
 for deployment on Databricks Model Serving.
-
-Usage
-=====
-    from src.agent import GenieQueryAgent
-    from src.serving_model import GenieResponsesAgent
-    
-    # Create the agent with configuration
-    agent = GenieQueryAgent(
-        space_id="your-space-id",
-        lakebase_instance="your-lakebase",  # optional
-    )
-    
-    # Wrap in ResponsesAgent
-    responses_agent = GenieResponsesAgent(agent)
-    
-    # Log to MLflow
-    mlflow.pyfunc.log_model(python_model=responses_agent, ...)
-
-The databricks_langchain components auto-authenticate in the serving environment.
 """
 from __future__ import annotations
 
@@ -79,6 +61,27 @@ class GenieResponsesAgent(ResponsesAgent):
                 return item.get("content", "")
         return ""
 
+    def _get_or_create_thread_id(self, request: ResponsesAgentRequest) -> str:
+        """Resolve the thread id from custom_inputs or ChatContext, or create a new one."""
+        custom_inputs = dict(request.custom_inputs or {})
+        if custom_inputs.get("thread_id"):
+            return str(custom_inputs["thread_id"])
+        if request.context and getattr(request.context, "conversation_id", None):
+            return str(request.context.conversation_id)
+        return str(uuid4())
+
+    def _has_existing_thread(self, request: ResponsesAgentRequest, config: dict) -> bool:
+        """Determine whether this request should resume an existing thread."""
+        has_thread_ref = bool(
+            (request.custom_inputs and request.custom_inputs.get("thread_id"))
+            or (request.context and getattr(request.context, "conversation_id", None))
+        )
+        if not has_thread_ref:
+            return False
+        state = self._get_graph_state(config)
+        values = getattr(state, "values", None) if state else None
+        return bool(values)
+
     def _get_graph_state(self, config: dict):
         """Get the current graph state for a thread."""
         try:
@@ -103,16 +106,13 @@ class GenieResponsesAgent(ResponsesAgent):
         - If thread_id exists: resume from checkpoint with user's response
         - If no thread_id: start a new conversation
         """
-        custom_inputs = request.custom_inputs or {}
-        thread_id = custom_inputs.get("thread_id") or str(uuid4())
+        thread_id = self._get_or_create_thread_id(request)
         config = {"configurable": {"thread_id": thread_id}}
         user_message = self._get_last_user_message(request.input)
         
-        if custom_inputs.get("thread_id"):
-            # Resume from checkpoint
+        if self._has_existing_thread(request, config):
             result = self.agent.graph.invoke(Command(resume=user_message), config)
         else:
-            # New conversation
             initial_state: AgentState = {
                 "messages": [HumanMessage(content=user_message)],
                 "conversation_id": None,
@@ -125,7 +125,6 @@ class GenieResponsesAgent(ResponsesAgent):
             }
             result = self.agent.graph.invoke(initial_state, config)
         
-        # Check final state - did we hit an interrupt or complete?
         state = self._get_graph_state(config)
         interrupt_value = self._get_interrupt_value(state)
         
@@ -196,15 +195,14 @@ class GenieResponsesAgent(ResponsesAgent):
         self, request: ResponsesAgentRequest
     ) -> Generator[ResponsesAgentStreamEvent, None, None]:
         """Handle a streaming prediction request."""
-        custom_inputs = request.custom_inputs or {}
-        thread_id = custom_inputs.get("thread_id") or str(uuid4())
+        thread_id = self._get_or_create_thread_id(request)
         config = {"configurable": {"thread_id": thread_id}}
         user_message = self._get_last_user_message(request.input)
         msg_id = f"msg-{uuid4().hex[:8]}"
         final_text = ""
         
         try:
-            if custom_inputs.get("thread_id"):
+            if self._has_existing_thread(request, config):
                 result = self.agent.graph.invoke(Command(resume=user_message), config)
             else:
                 initial_state: AgentState = {

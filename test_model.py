@@ -1,7 +1,9 @@
 """Test the GenieResponsesAgent locally."""
 import os
+from dotenv import load_dotenv
+load_dotenv()
 
-os.environ["DATABRICKS_CONFIG_PROFILE"] = "FE-EAST"
+profile = os.getenv("DATABRICKS_CONFIG_PROFILE", "DEFAULT")
 
 from src.serving_model import MODEL
 from mlflow.types.responses import ResponsesAgentRequest
@@ -17,8 +19,7 @@ if __name__ == "__main__":
     print(f"\nResponse ID: {response.id}")
     print(f"Status: {response.custom_outputs.get('status')}")
     print(f"Thread ID: {response.custom_outputs.get('thread_id')}")
-    
-    # Print the output
+
     for output in response.output:
         print(f"\nOutput type: {output.type}")
         if hasattr(output, 'content'):

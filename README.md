@@ -25,22 +25,6 @@ Sync dependencies:
 uv sync
 ```
 
-## Usage
-
-Run the agent:
-```bash
-uv run src/main.py
-```
-
-Configure your Databricks profile and Genie Space in `src/main.py`:
-```python
-PROFILE = "FE-EAST"
-SPACE_NAME = "Healthcare Genie"
-SPACE_ID = "1234"
-```
-
-Note the `PROFILE` is that configured in your `~/.databrickscfg` (see here: https://docs.databricks.com/aws/en/dev-tools/cli/). The `SPACE_NAME` is the name of your Genie space, and the `SPACE_ID` is found in the Genie space's URL. 
-
 ## Limitations
 This is a demo application and not meant to be used in production without modification. Simplifications are:
 - No result data retrieval (only execution confirmation)
